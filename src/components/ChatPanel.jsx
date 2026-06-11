@@ -46,6 +46,37 @@ function AssistantMessage({ content, streaming }) {
   )
 }
 
+function PeerMessage({ from, text }) {
+  return (
+    <div style={{
+      display: 'flex', gap: 8, padding: '12px 16px',
+      background: 'rgba(80,160,255,0.05)',
+    }}>
+      <div style={{
+        width: 24, height: 24, borderRadius: '50%',
+        background: 'linear-gradient(135deg, #1a6ea0, #4fc1ff)',
+        display: 'flex', alignItems: 'center', justifyContent: 'center',
+        fontSize: 11, fontWeight: 700, flexShrink: 0, color: '#fff',
+      }}>{(from ?? '?')[0].toUpperCase()}</div>
+      <div style={{ flex: 1 }}>
+        <div style={{ fontSize: 11, color: '#4fc1ff', marginBottom: 2 }}>{from}</div>
+        <pre style={{
+          fontFamily: 'inherit', fontSize: 13, lineHeight: 1.6,
+          color: 'var(--vsc-text)', whiteSpace: 'pre-wrap', wordBreak: 'break-word', margin: 0,
+        }}>{text}</pre>
+      </div>
+    </div>
+  )
+}
+
+function SystemMessage({ text }) {
+  return (
+    <div style={{ padding: '6px 16px', fontSize: 12, color: 'var(--vsc-text-dim)', textAlign: 'center' }}>
+      {text}
+    </div>
+  )
+}
+
 function ContextBadge({ file, ragStats }) {
   if (!file && !ragStats) return null
   return (
@@ -144,9 +175,10 @@ export default function ChatPanel({
         )}
 
         {messages.map((msg, i) => (
-          msg.role === 'user'
-            ? <UserMessage key={i} text={msg.content} />
-            : <AssistantMessage key={i} content={msg.content} streaming={false} />
+          msg.role === 'user'   ? <UserMessage key={i} text={msg.content} /> :
+          msg.role === 'peer'   ? <PeerMessage key={i} from={msg.from} text={msg.content} /> :
+          msg.role === 'system' ? <SystemMessage key={i} text={msg.content} /> :
+                                  <AssistantMessage key={i} content={msg.content} streaming={false} />
         ))}
 
         {isStreaming && (

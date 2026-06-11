@@ -11,6 +11,8 @@ import { cloneRepo, listFiles, readFile, writeFile } from './lib/gitWorkspace'
 import { parseSearchReplace, applyPatches, buildPrompt, generateUnifiedDiff } from './lib/orchestrator'
 import { MODELS } from './lib/models'
 import { indexFile, clearIndex, getIndexStats, buildContextBlock } from './lib/codeRag'
+import AgentsPanel from './components/AgentsPanel'
+import { PeerManager, encodeSDP, decodeSDP, buildInviteURL, getInviteOfferFromHash } from './lib/peerManager'
 import './index.css'
 
 export default function App() {
@@ -40,13 +42,27 @@ export default function App() {
   // UI
   const [activePanel, setActivePanel]   = useState('explorer')
 
+  // Agent herd (multi-agent mesh)
+  const [agentName, setAgentName]   = useState('')
+  const [herdStarted, setHerdStarted] = useState(false)
+  const [peers, setPeers]           = useState([])
+  const [invite, setInvite]         = useState(null)   // { url, slot }
+  const [answerToken, setAnswerToken] = useState('')
+  const [joinToken, setJoinToken]   = useState('')     // our answer token (answerer flow)
+  const [herdStatus, setHerdStatus] = useState('')
+  const [inboundOffer]              = useState(() => getInviteOfferFromHash())
+
   const workerRef      = useRef(null)
   const resolveGenRef  = useRef(null)
   const fullOutputRef  = useRef('')
+  const pmRef          = useRef(null)
+  const inviteSlotSeq  = useRef(0)
 
   useEffect(() => {
     setGpuStatus(navigator.gpu ? 'active' : 'unavailable')
-  }, [])
+    // Arrived via an AgentHerd invite link — open the Agents panel
+    if (inboundOffer) setActivePanel('agents')
+  }, [inboundOffer])
 
   useEffect(() => {
     const worker = new Worker(
@@ -166,6 +182,7 @@ export default function App() {
     const userText = prompt.trim()
     setPrompt('')
     setMessages(prev => [...prev, { role: 'user', content: userText }])
+    pmRef.current?.broadcast({ type: 'chat', content: `🧑 prompt on ${selectedFile.path}: ${userText}` })
     setIsStreaming(true)
     setStreamingContent('')
     setAgentError('')
@@ -193,11 +210,13 @@ export default function App() {
       if (blocks.length === 0) {
         // No patch blocks — treat as a plain answer
         setMessages(prev => [...prev, { role: 'assistant', content: rawOutput }])
+        pmRef.current?.broadcast({ type: 'chat', content: `✦ answered: ${rawOutput.slice(0, 500)}` })
         return
       }
       const newContent = applyPatches(selectedFile.content, blocks)
       const patch = generateUnifiedDiff(selectedFile.path, selectedFile.content, newContent)
       setDiff({ path: selectedFile.path, before: selectedFile.content, after: newContent, patch })
+      pmRef.current?.broadcast({ type: 'diff', path: selectedFile.path, patch })
       setMessages(prev => [...prev, {
         role: 'assistant',
         content: `Generated ${blocks.length} change${blocks.length > 1 ? 's' : ''}. Review the diff →`,
@@ -216,6 +235,84 @@ export default function App() {
     setSelectedFile({ path: diff.path, content: diff.after })
     setDiff(null)
   }, [diff])
+
+  // ── Agent herd (AgentHerd-style full-mesh WebRTC) ──────────────────
+  const refreshPeers = useCallback(() => {
+    const pm = pmRef.current
+    setPeers(pm ? [...pm.peers.values()].map(p => ({
+      name: p.name, modelLabel: p.modelLabel, repo: p.repo, state: p.state,
+    })) : [])
+  }, [])
+
+  const startHerd = useCallback(async () => {
+    const name = agentName.trim()
+    if (!name || pmRef.current) return
+
+    const pm = new PeerManager({
+      myName: name,
+      myModelLabel: selectedModel,
+      myRepo: repoUrl.trim() || null,
+      onPeerJoin: (peerName) => {
+        refreshPeers()
+        setMessages(prev => [...prev, { role: 'system', content: `🤝 ${peerName} joined the herd` }])
+      },
+      onPeerLeave: (peerName) => {
+        refreshPeers()
+        setMessages(prev => [...prev, { role: 'system', content: `👋 ${peerName} left the herd` }])
+      },
+      onPeerState: refreshPeers,
+      onMessage: (from, msg) => {
+        if (msg.type === 'chat') {
+          setMessages(prev => [...prev, { role: 'peer', from, content: msg.content }])
+        } else if (msg.type === 'diff') {
+          setMessages(prev => [...prev, {
+            role: 'peer', from,
+            content: `proposed a patch for ${msg.path}:\n\n${msg.patch}`,
+          }])
+        }
+      },
+    })
+    pmRef.current = pm
+    setHerdStarted(true)
+    setHerdStatus('')
+
+    // Answerer flow: page opened from an invite link
+    if (inboundOffer) {
+      try {
+        setHerdStatus('Accepting invite…')
+        const offer = await decodeSDP(inboundOffer)
+        const sdp = await pm.acceptOffer('host', offer)
+        setJoinToken(await encodeSDP(sdp))
+        setHerdStatus('')
+      } catch {
+        setHerdStatus('Invalid invite link.')
+      }
+    }
+  }, [agentName, selectedModel, repoUrl, inboundOffer, refreshPeers])
+
+  const handleCreateInvite = useCallback(async () => {
+    const pm = pmRef.current
+    if (!pm || invite) return
+    setHerdStatus('Gathering ICE candidates…')
+    const slot = `slot-${++inviteSlotSeq.current}`
+    const sdp = await pm.createOffer(slot)
+    setInvite({ url: buildInviteURL(await encodeSDP(sdp)), slot })
+    setHerdStatus('')
+    refreshPeers()
+  }, [invite, refreshPeers])
+
+  const handleConnectAnswer = useCallback(async () => {
+    const pm = pmRef.current
+    if (!pm || !invite || !answerToken.trim()) return
+    try {
+      await pm.setAnswer(invite.slot, await decodeSDP(answerToken))
+      setInvite(null)
+      setAnswerToken('')
+      setHerdStatus('')
+    } catch {
+      setHerdStatus('Invalid answer token. Try again.')
+    }
+  }, [invite, answerToken])
 
   const handleDownloadPatch = useCallback(() => {
     if (!diff) return
@@ -293,12 +390,30 @@ export default function App() {
           borderRight: '1px solid var(--vsc-border)',
           overflow: 'hidden', display: 'flex', flexDirection: 'column',
         }}>
-          <Sidebar
-            tree={fileTree}
-            onSelect={handleSelectFile}
-            selected={selectedFile?.path}
-            ragStats={ragStats}
-          />
+          {activePanel === 'agents' ? (
+            <AgentsPanel
+              agentName={agentName}
+              setAgentName={setAgentName}
+              started={herdStarted}
+              onStart={startHerd}
+              peers={peers}
+              invite={invite}
+              onCreateInvite={handleCreateInvite}
+              answerToken={answerToken}
+              setAnswerToken={setAnswerToken}
+              onConnectAnswer={handleConnectAnswer}
+              inboundOffer={!!inboundOffer}
+              joinToken={joinToken}
+              status={herdStatus}
+            />
+          ) : (
+            <Sidebar
+              tree={fileTree}
+              onSelect={handleSelectFile}
+              selected={selectedFile?.path}
+              ragStats={ragStats}
+            />
+          )}
         </div>
 
         {/* Editor */}

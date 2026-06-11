@@ -15,6 +15,12 @@ const icons = {
       <path d="M6 9v6M15.5 6H13a4 4 0 00-4 4v1"/>
     </svg>
   ),
+  agents: (
+    <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5">
+      <circle cx="9" cy="8" r="3"/><circle cx="17" cy="10" r="2.5"/>
+      <path d="M3 20v-1a6 6 0 0112 0v1M14.5 20v-.5a4.5 4.5 0 017 0v.5"/>
+    </svg>
+  ),
   settings: (
     <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5">
       <circle cx="12" cy="12" r="3"/>
@@ -28,6 +34,7 @@ export default function ActivityBar({ active, onChange }) {
     { id: 'explorer', title: 'Explorer' },
     { id: 'chat',     title: 'Copilot Chat' },
     { id: 'git',      title: 'Source Control' },
+    { id: 'agents',   title: 'Agent Herd' },
   ]
 
   return (
