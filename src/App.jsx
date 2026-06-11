@@ -129,20 +129,31 @@ export default function App() {
   }, [gpuStatus, selectedModel])
 
   // ── Clone + index ──────────────────────────────────────────────────
-  const handleClone = useCallback(async () => {
-    if (!repoUrl.trim()) return
+  const hasRepoRef = useRef(false)
+
+  const doClone = useCallback(async (url) => {
+    if (!url.trim()) return
+    setRepoUrl(url.trim())
     setCloneStatus('cloning')
     setFileTree([])
     setSelectedFile(null)
     setDiff(null)
     clearIndex()
     setRagStats(null)
+    hasRepoRef.current = false
 
     try {
-      await cloneRepo(repoUrl.trim(), () => {})
+      await cloneRepo(url.trim(), () => {})
       const tree = await listFiles()
       setFileTree(tree)
       setCloneStatus('done')
+      hasRepoRef.current = true
+
+      // Tell the herd which repo we're on so peers can sync to it
+      if (pmRef.current) {
+        pmRef.current.myRepo = url.trim()
+        pmRef.current.broadcast({ type: 'repo', url: url.trim() })
+      }
 
       // Index all files for RAG in the background
       await indexAllFiles(tree)
@@ -151,7 +162,13 @@ export default function App() {
       setCloneStatus('error')
       setAgentError(err.message)
     }
-  }, [repoUrl])
+  }, [])
+
+  // Latest doClone, callable from PeerManager callbacks created at herd start
+  const doCloneRef = useRef(doClone)
+  doCloneRef.current = doClone
+
+  const handleClone = useCallback(() => doClone(repoUrl), [doClone, repoUrl])
 
   async function indexAllFiles(nodes) {
     for (const node of nodes) {
@@ -216,7 +233,10 @@ export default function App() {
       const newContent = applyPatches(selectedFile.content, blocks)
       const patch = generateUnifiedDiff(selectedFile.path, selectedFile.content, newContent)
       setDiff({ path: selectedFile.path, before: selectedFile.content, after: newContent, patch })
-      pmRef.current?.broadcast({ type: 'diff', path: selectedFile.path, patch })
+      pmRef.current?.broadcast({
+        type: 'diff', path: selectedFile.path, patch,
+        before: selectedFile.content, after: newContent,
+      })
       setMessages(prev => [...prev, {
         role: 'assistant',
         content: `Generated ${blocks.length} change${blocks.length > 1 ? 's' : ''}. Review the diff →`,
@@ -229,6 +249,10 @@ export default function App() {
   const handleApplyDiff = useCallback(async () => {
     if (!diff) return
     await writeFile(diff.path, diff.after)
+    pmRef.current?.broadcast({
+      type: 'chat',
+      content: `✅ applied ${diff.from ? `${diff.from}'s` : 'a'} patch to ${diff.path}`,
+    })
     // Re-index the changed file
     indexFile(diff.path, diff.after)
     setRagStats(getIndexStats())
@@ -252,9 +276,14 @@ export default function App() {
       myName: name,
       myModelLabel: selectedModel,
       myRepo: repoUrl.trim() || null,
-      onPeerJoin: (peerName) => {
+      onPeerJoin: (peerName, hello) => {
         refreshPeers()
         setMessages(prev => [...prev, { role: 'system', content: `🤝 ${peerName} joined the herd` }])
+        // Sync workspaces: adopt the peer's repo if we don't have one yet
+        if (hello?.repo && !hasRepoRef.current) {
+          setMessages(prev => [...prev, { role: 'system', content: `📦 Cloning ${peerName}'s repo: ${hello.repo}` }])
+          doCloneRef.current(hello.repo)
+        }
       },
       onPeerLeave: (peerName) => {
         refreshPeers()
@@ -264,11 +293,21 @@ export default function App() {
       onMessage: (from, msg) => {
         if (msg.type === 'chat') {
           setMessages(prev => [...prev, { role: 'peer', from, content: msg.content }])
+        } else if (msg.type === 'repo') {
+          // A peer cloned a repo — follow them onto it if we have none
+          if (msg.url && !hasRepoRef.current) {
+            setMessages(prev => [...prev, { role: 'system', content: `📦 ${from} is on ${msg.url} — cloning…` }])
+            doCloneRef.current(msg.url)
+          }
         } else if (msg.type === 'diff') {
           setMessages(prev => [...prev, {
             role: 'peer', from,
-            content: `proposed a patch for ${msg.path}:\n\n${msg.patch}`,
+            content: `proposed a patch for ${msg.path} — review it in the diff viewer →`,
           }])
+          // Open the peer's patch in our own diff viewer; Apply writes it to our copy
+          if (msg.before != null && msg.after != null) {
+            setDiff({ path: msg.path, before: msg.before, after: msg.after, patch: msg.patch, from })
+          }
         }
       },
     })
