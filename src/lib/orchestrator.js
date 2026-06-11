@@ -96,6 +96,69 @@ function fitFileContent(filePath, fileContent, userPrompt, contextBlock) {
   return `${fileBlock}${contextSection}\n\n${taskLine}`
 }
 
+// ── Project-wide mode ────────────────────────────────────────────────────────
+// No file selected: RAG picks candidate files, the model targets them with
+// FILE:-headed SEARCH/REPLACE blocks so one answer can patch several files.
+
+export function buildProjectPrompt(userPrompt, fileSections, contextBlock = '') {
+  const taskLine = `Task: ${userPrompt}`
+  const available = USER_BUDGET - rough(taskLine) - 20
+
+  let contextSection = ''
+  if (contextBlock) {
+    const truncated = truncateToTokens(contextBlock, Math.floor(available * 0.25))
+    if (truncated) contextSection = `\n\n${truncated}\n---`
+  }
+
+  let fileBudget = available - rough(contextSection)
+  const blocks = []
+  for (const { path, content } of fileSections) {
+    const type = detectContentType(content)
+    let body = content
+    let label = path
+    if (rough(body) > fileBudget / fileSections.length) {
+      body = type === 'code' ? compressCode(content) : content
+      label = `${path} (compressed)`
+    }
+    const block = `File: ${label}\n\`\`\`\n${truncateToTokens(body, Math.floor(fileBudget / fileSections.length))}\n\`\`\``
+    blocks.push(block)
+    fileBudget -= rough(block)
+  }
+
+  return [
+    {
+      role: 'system',
+      content: `You are DevPal, an expert AI coding agent working across a whole repository. Output ONLY patches in this format:
+
+FILE: exact/path/from/listing
+<<<<<<< SEARCH
+[exact lines from that file]
+=======
+[replacement]
+>>>>>>> REPLACE
+
+Rules: every patch starts with a FILE: line naming one of the provided files. SEARCH must match exactly (whitespace matters). Multiple changes = multiple FILE/patch groups. If the task is a question rather than a change, answer in plain prose with no patch blocks.`,
+    },
+    { role: 'user', content: `${blocks.join('\n\n')}${contextSection}\n\n${taskLine}` },
+  ]
+}
+
+// Parse FILE:-headed output into [{ path, blocks: [{search, replace}] }]
+export function parseFilePatches(output) {
+  const sections = output.split(/^FILE:[ \t]*(.+)$/m)
+  const results = []
+  // sections: [preamble, path1, body1, path2, body2, …]
+  for (let i = 1; i < sections.length; i += 2) {
+    const path = sections[i].trim().replace(/^["'`]|["'`]$/g, '')
+    const blocks = parseSearchReplace(sections[i + 1] ?? '')
+    if (blocks.length === 0) continue
+    const existing = results.find(r => r.path === path)
+    if (existing) existing.blocks.push(...blocks)
+    else results.push({ path, blocks })
+  }
+  return results
+}
+
 function truncateToTokens(text, maxTokens) {
   const maxChars = maxTokens * 4
   if (text.length <= maxChars) return text

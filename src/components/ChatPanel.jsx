@@ -134,11 +134,13 @@ export default function ChatPanel({
     }
   }
 
-  const placeholder = !selectedFile
-    ? 'Select a file to start editing…'
-    : modelStatus !== 'ready'
+  const placeholder = modelStatus !== 'ready'
     ? 'Load an AI model first (header)…'
-    : 'Ask DevPal (Enter to send, Shift+Enter for newline)…'
+    : !selectedFile && !(ragStats?.files > 0)
+    ? 'Clone a repo to work project-wide, or select a file…'
+    : selectedFile
+    ? `Ask DevPal about ${selectedFile.path.split('/').pop()} (Enter to send)…`
+    : 'Ask DevPal about the whole project (Enter to send)…'
 
   return (
     <div style={{
@@ -168,8 +170,8 @@ export default function ChatPanel({
           }}>
             <div style={{ fontSize: 32 }}>✦</div>
             <p style={{ color: 'var(--vsc-text-dim)', textAlign: 'center', fontSize: 13, lineHeight: 1.6 }}>
-              Select a file, then describe your change.
-              <br/>DevPal generates SEARCH/REPLACE patches locally.
+              Clone a repo and describe your change — DevPal finds the
+              <br/>relevant files itself. Select a file to focus it on one.
             </p>
           </div>
         )}

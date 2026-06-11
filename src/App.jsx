@@ -8,16 +8,31 @@ import FileViewer from './components/FileViewer'
 import StatusBar from './components/StatusBar'
 import ModelLoader from './components/ModelLoader'
 import { cloneRepo, listFiles, readFile, writeFile } from './lib/gitWorkspace'
-import { parseSearchReplace, applyPatches, buildPrompt, generateUnifiedDiff } from './lib/orchestrator'
+import { parseSearchReplace, applyPatches, buildPrompt, generateUnifiedDiff, buildProjectPrompt, parseFilePatches } from './lib/orchestrator'
 import { MODELS } from './lib/models'
-import { indexFile, clearIndex, getIndexStats, buildContextBlock } from './lib/codeRag'
+import { indexFile, clearIndex, getIndexStats, buildContextBlock, retrieveContext } from './lib/codeRag'
 import AgentsPanel from './components/AgentsPanel'
 import { PeerManager, encodeSDP, decodeSDP, buildInviteURL, getInviteOfferFromHash } from './lib/peerManager'
 import './index.css'
 
+async function indexAllFiles(nodes) {
+  for (const node of nodes) {
+    if (node.type === 'dir') {
+      await indexAllFiles(node.children ?? [])
+    } else {
+      try {
+        const content = await readFile(node.path)
+        indexFile(node.path, content)
+      } catch {
+        // unreadable file — skip indexing it
+      }
+    }
+  }
+}
+
 export default function App() {
   // Engine
-  const [gpuStatus, setGpuStatus]       = useState('checking')
+  const [gpuStatus]                     = useState(() => navigator.gpu ? 'active' : 'unavailable')
   const [selectedModel, setSelectedModel] = useState(MODELS[0].id)
   const [modelStatus, setModelStatus]   = useState('idle')
   const [modelProgress, setModelProgress] = useState(null)
@@ -40,7 +55,8 @@ export default function App() {
   const [agentError, setAgentError]     = useState('')
 
   // UI
-  const [activePanel, setActivePanel]   = useState('explorer')
+  // Arrived via an AgentHerd invite link — open the Agents panel
+  const [activePanel, setActivePanel]   = useState(() => getInviteOfferFromHash() ? 'agents' : 'explorer')
 
   // Agent herd (multi-agent mesh)
   const [agentName, setAgentName]   = useState('')
@@ -50,6 +66,9 @@ export default function App() {
   const [answerToken, setAnswerToken] = useState('')
   const [joinToken, setJoinToken]   = useState('')     // our answer token (answerer flow)
   const [herdStatus, setHerdStatus] = useState('')
+  const [autoCollab, setAutoCollab] = useState(true)
+  const autoCollabRef = useRef(true)
+  useEffect(() => { autoCollabRef.current = autoCollab }, [autoCollab])
   const [inboundOffer]              = useState(() => getInviteOfferFromHash())
 
   const workerRef      = useRef(null)
@@ -57,12 +76,6 @@ export default function App() {
   const fullOutputRef  = useRef('')
   const pmRef          = useRef(null)
   const inviteSlotSeq  = useRef(0)
-
-  useEffect(() => {
-    setGpuStatus(navigator.gpu ? 'active' : 'unavailable')
-    // Arrived via an AgentHerd invite link — open the Agents panel
-    if (inboundOffer) setActivePanel('agents')
-  }, [inboundOffer])
 
   useEffect(() => {
     const worker = new Worker(
@@ -166,22 +179,9 @@ export default function App() {
 
   // Latest doClone, callable from PeerManager callbacks created at herd start
   const doCloneRef = useRef(doClone)
-  doCloneRef.current = doClone
+  useEffect(() => { doCloneRef.current = doClone }, [doClone])
 
   const handleClone = useCallback(() => doClone(repoUrl), [doClone, repoUrl])
-
-  async function indexAllFiles(nodes) {
-    for (const node of nodes) {
-      if (node.type === 'dir') {
-        await indexAllFiles(node.children ?? [])
-      } else {
-        try {
-          const content = await readFile(node.path)
-          indexFile(node.path, content)
-        } catch (_) {}
-      }
-    }
-  }
 
   const handleSelectFile = useCallback(async (node) => {
     if (node.type !== 'file') return
@@ -193,70 +193,149 @@ export default function App() {
   }, [])
 
   // ── Agent run ──────────────────────────────────────────────────────
-  const handleSend = useCallback(async () => {
-    if (!selectedFile || !prompt.trim() || modelStatus !== 'ready' || isStreaming) return
+  // Refs mirroring state so PeerManager callbacks (created once) see live values
+  const selectedFileRef = useRef(null)
+  useEffect(() => { selectedFileRef.current = selectedFile }, [selectedFile])
+  const modelReadyRef = useRef(false)
+  useEffect(() => { modelReadyRef.current = modelStatus === 'ready' }, [modelStatus])
+  const busyRef = useRef(false)
 
-    const userText = prompt.trim()
-    setPrompt('')
-    setMessages(prev => [...prev, { role: 'user', content: userText }])
-    pmRef.current?.broadcast({ type: 'chat', content: `🧑 prompt on ${selectedFile.path}: ${userText}` })
+  const generate = useCallback(async (msgs) => {
     setIsStreaming(true)
     setStreamingContent('')
     setAgentError('')
     fullOutputRef.current = ''
-
-    // Build RAG context
-    const contextBlock = buildContextBlock(userText, 4)
-
-    const messages = buildPrompt(selectedFile.path, selectedFile.content, userText, contextBlock)
-    workerRef.current.postMessage({ action: 'generate', messages, gen: Date.now() })
-
+    workerRef.current.postMessage({ action: 'generate', messages: msgs, gen: Date.now() })
     const result = await new Promise(resolve => { resolveGenRef.current = resolve })
     setIsStreaming(false)
+    setStreamingContent('')
+    return result
+  }, [])
 
-    if (result?.error) {
-      setMessages(prev => [...prev, { role: 'assistant', content: `⚠ Error: ${result.error}` }])
+  // Run a task with the local model. File mode if a file is selected (and not
+  // forced to project scope); otherwise project mode: RAG picks target files
+  // and the model emits FILE:-headed patches that may span several files.
+  // Returns { answer } or { diffObj } or { error }.
+  const runTask = useCallback(async (userText, { projectScope = false } = {}) => {
+    if (busyRef.current || !modelReadyRef.current) return { error: 'busy or model not ready' }
+    busyRef.current = true
+    try {
+      const file = projectScope ? null : selectedFileRef.current
+      const contextBlock = buildContextBlock(userText, 4)
+      let msgs
+      if (file) {
+        msgs = buildPrompt(file.path, file.content, userText, contextBlock)
+      } else {
+        // Project mode: feed top-2 RAG hits in full, rest stays in context block
+        const hits = retrieveContext(userText, 3)
+        const sections = []
+        for (const h of hits.slice(0, 2)) {
+          try { sections.push({ path: h.path, content: await readFile(h.path) }) } catch { /* deleted */ }
+        }
+        msgs = buildProjectPrompt(userText, sections, contextBlock)
+      }
+
+      const result = await generate(msgs)
+      if (result?.error) return { error: result.error }
+      const rawOutput = fullOutputRef.current
+
+      if (file) {
+        const blocks = parseSearchReplace(rawOutput)
+        if (blocks.length === 0) return { answer: rawOutput }
+        const newContent = applyPatches(file.content, blocks)
+        const patch = generateUnifiedDiff(file.path, file.content, newContent)
+        return { diffObj: { path: file.path, before: file.content, after: newContent, patch, files: [{ path: file.path, before: file.content, after: newContent }] } }
+      }
+
+      const filePatches = parseFilePatches(rawOutput)
+      if (filePatches.length === 0) return { answer: rawOutput }
+      const files = []
+      for (const fp of filePatches) {
+        const before = await readFile(fp.path)
+        const after = applyPatches(before, fp.blocks)
+        files.push({ path: fp.path, before, after })
+      }
+      const patch = files.map(f => generateUnifiedDiff(f.path, f.before, f.after)).join('\n')
+      return { diffObj: { path: files.map(f => f.path).join(', '), patch, files } }
+    } catch (err) {
+      return { error: err.message, raw: fullOutputRef.current }
+    } finally {
+      busyRef.current = false
+    }
+  }, [generate])
+
+  const presentResult = useCallback((res, { broadcast = true } = {}) => {
+    if (res.error) {
+      setMessages(prev => [...prev, { role: 'assistant', content: `⚠ ${res.error}${res.raw ? `\n\nRaw output:\n${res.raw}` : ''}` }])
       return
     }
-
-    const rawOutput = fullOutputRef.current
-    setStreamingContent('')
-
-    try {
-      const blocks = parseSearchReplace(rawOutput)
-      if (blocks.length === 0) {
-        // No patch blocks — treat as a plain answer
-        setMessages(prev => [...prev, { role: 'assistant', content: rawOutput }])
-        pmRef.current?.broadcast({ type: 'chat', content: `✦ answered: ${rawOutput.slice(0, 500)}` })
-        return
-      }
-      const newContent = applyPatches(selectedFile.content, blocks)
-      const patch = generateUnifiedDiff(selectedFile.path, selectedFile.content, newContent)
-      setDiff({ path: selectedFile.path, before: selectedFile.content, after: newContent, patch })
-      pmRef.current?.broadcast({
-        type: 'diff', path: selectedFile.path, patch,
-        before: selectedFile.content, after: newContent,
-      })
-      setMessages(prev => [...prev, {
-        role: 'assistant',
-        content: `Generated ${blocks.length} change${blocks.length > 1 ? 's' : ''}. Review the diff →`,
-      }])
-    } catch (err) {
-      setMessages(prev => [...prev, { role: 'assistant', content: `⚠ Patch error: ${err.message}\n\nRaw output:\n${rawOutput}` }])
+    if (res.answer) {
+      setMessages(prev => [...prev, { role: 'assistant', content: res.answer }])
+      if (broadcast) pmRef.current?.broadcast({ type: 'chat', content: `✦ answered: ${res.answer.slice(0, 500)}` })
+      return
     }
-  }, [selectedFile, prompt, modelStatus, isStreaming])
+    const d = res.diffObj
+    setDiff(d)
+    setMessages(prev => [...prev, { role: 'assistant', content: `Generated changes to ${d.path}. Review the diff →` }])
+    if (broadcast) pmRef.current?.broadcast({ type: 'diff', path: d.path, patch: d.patch, files: d.files })
+  }, [])
+
+  // Collaborate on a peer's task: run it locally (project scope), reply with
+  // the result, and hand the conversation back with one fewer round left.
+  const collabRef = useRef(() => {})
+  async function collaborate(from, task, rounds) {
+    if (!modelReadyRef.current || busyRef.current || !hasRepoRef.current) return
+    setMessages(prev => [...prev, { role: 'system', content: `🤖 collaborating on ${from}'s task (${rounds} rounds left)…` }])
+    const res = await runTask(task, { projectScope: true })
+    if (res.error) return
+    presentResult(res, { broadcast: false })
+    const summary = res.answer
+      ? res.answer.slice(0, 500)
+      : `proposed a patch to ${res.diffObj.path}`
+    pmRef.current?.broadcast({
+      type: 'chat',
+      content: `✦ on ${from}'s task: ${summary}`,
+      task: rounds > 1
+        ? `Task: ${task}\nPeer ${from} progress: ${summary}\nContinue the task, improve the result, or reply DONE if complete.`
+        : undefined,
+      rounds: rounds - 1,
+    })
+    if (res.diffObj) {
+      pmRef.current?.broadcast({ type: 'diff', path: res.diffObj.path, patch: res.diffObj.patch, files: res.diffObj.files })
+    }
+  }
+  useEffect(() => { collabRef.current = collaborate })
+
+  const handleSend = useCallback(async () => {
+    const hasWorkspace = selectedFile || hasRepoRef.current
+    if (!hasWorkspace || !prompt.trim() || modelStatus !== 'ready' || isStreaming) return
+
+    const userText = prompt.trim()
+    setPrompt('')
+    setMessages(prev => [...prev, { role: 'user', content: userText }])
+    pmRef.current?.broadcast({
+      type: 'chat',
+      content: `🧑 task${selectedFile ? ` on ${selectedFile.path}` : ''}: ${userText}`,
+      task: userText,
+      rounds: 4,
+    })
+    presentResult(await runTask(userText))
+  }, [selectedFile, prompt, modelStatus, isStreaming, runTask, presentResult])
 
   const handleApplyDiff = useCallback(async () => {
     if (!diff) return
-    await writeFile(diff.path, diff.after)
+    const files = diff.files ?? [{ path: diff.path, after: diff.after }]
+    for (const f of files) {
+      await writeFile(f.path, f.after)
+      indexFile(f.path, f.after)
+    }
     pmRef.current?.broadcast({
       type: 'chat',
       content: `✅ applied ${diff.from ? `${diff.from}'s` : 'a'} patch to ${diff.path}`,
     })
-    // Re-index the changed file
-    indexFile(diff.path, diff.after)
     setRagStats(getIndexStats())
-    setSelectedFile({ path: diff.path, content: diff.after })
+    const last = files[files.length - 1]
+    setSelectedFile({ path: last.path, content: last.after })
     setDiff(null)
   }, [diff])
 
@@ -293,6 +372,11 @@ export default function App() {
       onMessage: (from, msg) => {
         if (msg.type === 'chat') {
           setMessages(prev => [...prev, { role: 'peer', from, content: msg.content }])
+          // Collaborate: run the peer's task on our local model and reply.
+          // rounds caps the back-and-forth so two agents can't loop forever.
+          if (msg.task && msg.rounds > 0 && autoCollabRef.current) {
+            collabRef.current(from, msg.task, msg.rounds)
+          }
         } else if (msg.type === 'repo') {
           // A peer cloned a repo — follow them onto it if we have none
           if (msg.url && !hasRepoRef.current) {
@@ -305,7 +389,9 @@ export default function App() {
             content: `proposed a patch for ${msg.path} — review it in the diff viewer →`,
           }])
           // Open the peer's patch in our own diff viewer; Apply writes it to our copy
-          if (msg.before != null && msg.after != null) {
+          if (msg.files?.length) {
+            setDiff({ path: msg.path, patch: msg.patch, files: msg.files, from })
+          } else if (msg.before != null && msg.after != null) {
             setDiff({ path: msg.path, before: msg.before, after: msg.after, patch: msg.patch, from })
           }
         }
@@ -443,6 +529,8 @@ export default function App() {
               onConnectAnswer={handleConnectAnswer}
               inboundOffer={!!inboundOffer}
               joinToken={joinToken}
+              autoCollab={autoCollab}
+              setAutoCollab={setAutoCollab}
               status={herdStatus}
             />
           ) : (
@@ -491,7 +579,7 @@ export default function App() {
             prompt={prompt}
             setPrompt={setPrompt}
             onSend={handleSend}
-            disabled={isStreaming || modelStatus !== 'ready' || !selectedFile}
+            disabled={isStreaming || modelStatus !== 'ready' || (!selectedFile && cloneStatus !== 'done')}
             selectedFile={selectedFile}
             ragStats={ragStats}
             modelStatus={modelStatus}

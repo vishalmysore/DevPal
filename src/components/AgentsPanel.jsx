@@ -34,6 +34,7 @@ export default function AgentsPanel({
   answerToken, setAnswerToken, onConnectAnswer,
   inboundOffer,    // true when the page was opened from an invite link
   joinToken,       // answer token to send back to the inviter
+  autoCollab, setAutoCollab,
   status,
 }) {
   const [copied, setCopied] = useState('')
@@ -117,6 +118,22 @@ export default function AgentsPanel({
               </>
             )}
           </div>
+
+          {/* Collaboration */}
+          <label style={{ display: 'flex', alignItems: 'center', gap: 8, cursor: 'pointer' }}>
+            <input
+              type="checkbox"
+              checked={autoCollab}
+              onChange={e => setAutoCollab(e.target.checked)}
+              style={{ accentColor: 'var(--vsc-accent, #0078d4)' }}
+            />
+            <span>
+              Auto-collaborate
+              <span style={{ display: 'block', fontSize: 10, color: 'var(--vsc-text-dim)' }}>
+                Work on tasks sent by other agents with your local model
+              </span>
+            </span>
+          </label>
 
           {/* Peers */}
           <div>
