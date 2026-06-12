@@ -1,4 +1,13 @@
 import { useState } from 'react'
+import { ROLES } from '../lib/orchestrator'
+
+const TASK_PRESETS = [
+  { label: '🔍 Review code',     task: 'Review this codebase. Report bugs, edge cases, and code smells as findings with file references and severity. Patch only clear-cut defects.' },
+  { label: '🛡 Security review', task: 'Do a security review of this codebase. Look for injection, XSS, leaked secrets, unsafe input handling, and risky dependencies. Report findings with severity and fixes.' },
+  { label: '📝 Write docs',      task: 'Improve the documentation of this project: README, missing doc comments on public functions, and usage examples.' },
+  { label: '🧪 Generate tests',  task: 'Identify the most important untested behavior in this codebase and write tests for it, following the existing test style.' },
+  { label: '✨ Suggest features', task: 'Study this codebase and propose the three most valuable new features, with a short implementation sketch for each.' },
+]
 
 const inputStyle = {
   width: '100%', background: 'var(--vsc-input-bg, #3c3c3c)', border: '1px solid #555',
@@ -28,6 +37,8 @@ function dotColor(state) {
 // paste answer tokens, join from an inbound offer, see the mesh.
 export default function AgentsPanel({
   agentName, setAgentName, started, onStart,
+  myRole, setMyRole,
+  onAssignTask, taskReady,
   peers,
   invite,          // { url, slot } | null — the open invite awaiting an answer
   onCreateInvite,
@@ -38,6 +49,7 @@ export default function AgentsPanel({
   status,
 }) {
   const [copied, setCopied] = useState('')
+  const [customTask, setCustomTask] = useState('')
 
   const copy = async (text, tag) => {
     await navigator.clipboard.writeText(text)
@@ -64,6 +76,12 @@ export default function AgentsPanel({
             onChange={e => setAgentName(e.target.value)}
             onKeyDown={e => e.key === 'Enter' && agentName.trim() && onStart()}
           />
+          <span style={labelStyle}>Your role</span>
+          <select style={inputStyle} value={myRole} onChange={e => setMyRole(e.target.value)}>
+            {Object.entries(ROLES).map(([id, r]) => (
+              <option key={id} value={id}>{r.label}</option>
+            ))}
+          </select>
           <button style={buttonStyle(!agentName.trim())} disabled={!agentName.trim()} onClick={onStart}>
             {inboundOffer ? 'Join herd' : 'Start herd'}
           </button>
@@ -75,7 +93,41 @@ export default function AgentsPanel({
             <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
               <span style={{ width: 8, height: 8, borderRadius: '50%', background: 'var(--vsc-green, #4ec94e)', flexShrink: 0 }} />
               {agentName}
+              <span style={{ fontSize: 10, color: 'var(--vsc-text-dim)' }}>{ROLES[myRole]?.label}</span>
             </div>
+          </div>
+
+          {/* Herd tasks — human assigns, every agent works it from its role */}
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+            <span style={labelStyle}>Give the herd a task</span>
+            {!taskReady && (
+              <p style={{ margin: 0, color: 'var(--vsc-text-dim)' }}>Clone a repo first — tasks run against the shared codebase.</p>
+            )}
+            {TASK_PRESETS.map(p => (
+              <button
+                key={p.label}
+                style={{ ...buttonStyle(!taskReady), textAlign: 'left', background: taskReady ? '#2d2d30' : '#333', border: '1px solid #444' }}
+                disabled={!taskReady}
+                title={p.task}
+                onClick={() => onAssignTask(p.task)}
+              >
+                {p.label}
+              </button>
+            ))}
+            <textarea
+              value={customTask}
+              onChange={e => setCustomTask(e.target.value)}
+              rows={2}
+              placeholder="…or describe your own task"
+              style={{ ...inputStyle, resize: 'none' }}
+            />
+            <button
+              style={buttonStyle(!taskReady || !customTask.trim())}
+              disabled={!taskReady || !customTask.trim()}
+              onClick={() => { onAssignTask(customTask); setCustomTask('') }}
+            >
+              🎯 Assign to herd
+            </button>
           </div>
 
           {/* Answerer flow: we opened an invite link */}
@@ -146,9 +198,9 @@ export default function AgentsPanel({
                 <span style={{ width: 8, height: 8, borderRadius: '50%', background: dotColor(p.state), flexShrink: 0 }} />
                 <div style={{ overflow: 'hidden' }}>
                   <div style={{ whiteSpace: 'nowrap', textOverflow: 'ellipsis', overflow: 'hidden' }}>{p.name}</div>
-                  {(p.modelLabel || p.repo) && (
+                  {(p.role || p.modelLabel || p.repo) && (
                     <div style={{ fontSize: 10, color: 'var(--vsc-text-dim)', whiteSpace: 'nowrap', textOverflow: 'ellipsis', overflow: 'hidden' }}>
-                      {[p.modelLabel, p.repo].filter(Boolean).join(' · ')}
+                      {[ROLES[p.role]?.label, p.modelLabel, p.repo].filter(Boolean).join(' · ')}
                     </div>
                   )}
                 </div>

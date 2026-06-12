@@ -24,10 +24,11 @@ function waitForICE(pc) {
 }
 
 export class PeerManager {
-  peers = new Map() // key → {pc, channel, name, modelLabel, repo, state}
+  peers = new Map() // key → {pc, channel, name, role, modelLabel, repo, state}
 
-  constructor({ myName, myModelLabel, myRepo, onPeerJoin, onPeerLeave, onMessage, onPeerState }) {
+  constructor({ myName, myRole, myModelLabel, myRepo, onPeerJoin, onPeerLeave, onMessage, onPeerState }) {
     this.myName       = myName
+    this.myRole       = myRole
     this.myModelLabel = myModelLabel
     this.myRepo       = myRepo
     this.onPeerJoin   = onPeerJoin
@@ -112,6 +113,7 @@ export class PeerManager {
     ch.onopen = () => ch.send(JSON.stringify({
       type: 'hello',
       name: this.myName,
+      role: this.myRole,
       modelLabel: this.myModelLabel,
       repo: this.myRepo,
     }))
@@ -131,6 +133,7 @@ export class PeerManager {
           peer = this.peers.get(realName) ?? peer
         }
         if (peer) {
+          peer.role       = msg.role
           peer.modelLabel = msg.modelLabel
           peer.repo       = msg.repo
           peer.state      = 'connected'

@@ -60,6 +60,9 @@ export default function App() {
 
   // Agent herd (multi-agent mesh)
   const [agentName, setAgentName]   = useState('')
+  const [myRole, setMyRole]         = useState('generalist')
+  const myRoleRef = useRef('generalist')
+  useEffect(() => { myRoleRef.current = myRole }, [myRole])
   const [herdStarted, setHerdStarted] = useState(false)
   const [peers, setPeers]           = useState([])
   const [invite, setInvite]         = useState(null)   // { url, slot }
@@ -224,7 +227,7 @@ export default function App() {
       const contextBlock = buildContextBlock(userText, 4)
       let msgs
       if (file) {
-        msgs = buildPrompt(file.path, file.content, userText, contextBlock)
+        msgs = buildPrompt(file.path, file.content, userText, contextBlock, myRoleRef.current)
       } else {
         // Project mode: feed top-2 RAG hits in full, rest stays in context block
         const hits = retrieveContext(userText, 3)
@@ -232,7 +235,7 @@ export default function App() {
         for (const h of hits.slice(0, 2)) {
           try { sections.push({ path: h.path, content: await readFile(h.path) }) } catch { /* deleted */ }
         }
-        msgs = buildProjectPrompt(userText, sections, contextBlock)
+        msgs = buildProjectPrompt(userText, sections, contextBlock, myRoleRef.current)
       }
 
       const result = await generate(msgs)
@@ -306,6 +309,26 @@ export default function App() {
   }
   useEffect(() => { collabRef.current = collaborate })
 
+  // Human assigns a herd task: broadcast it to every agent (each works it
+  // from its own role's perspective) and run it locally with our role too.
+  const assignHerdTask = useCallback(async (taskText) => {
+    const text = taskText.trim()
+    if (!text || !hasRepoRef.current) return
+    setActivePanel('chat')
+    setMessages(prev => [...prev, { role: 'user', content: `🎯 Herd task: ${text}` }])
+    pmRef.current?.broadcast({
+      type: 'chat',
+      content: `🎯 assigned a herd task: ${text}`,
+      task: text,
+      rounds: 4,
+    })
+    if (modelReadyRef.current && !busyRef.current) {
+      presentResult(await runTask(text, { projectScope: true }))
+    } else {
+      setMessages(prev => [...prev, { role: 'system', content: '⏳ Task sent to the herd — load a model to contribute locally too.' }])
+    }
+  }, [runTask, presentResult])
+
   const handleSend = useCallback(async () => {
     const hasWorkspace = selectedFile || hasRepoRef.current
     if (!hasWorkspace || !prompt.trim() || modelStatus !== 'ready' || isStreaming) return
@@ -343,7 +366,7 @@ export default function App() {
   const refreshPeers = useCallback(() => {
     const pm = pmRef.current
     setPeers(pm ? [...pm.peers.values()].map(p => ({
-      name: p.name, modelLabel: p.modelLabel, repo: p.repo, state: p.state,
+      name: p.name, role: p.role, modelLabel: p.modelLabel, repo: p.repo, state: p.state,
     })) : [])
   }, [])
 
@@ -353,6 +376,7 @@ export default function App() {
 
     const pm = new PeerManager({
       myName: name,
+      myRole: myRole,
       myModelLabel: selectedModel,
       myRepo: repoUrl.trim() || null,
       onPeerJoin: (peerName, hello) => {
@@ -413,7 +437,7 @@ export default function App() {
         setHerdStatus('Invalid invite link.')
       }
     }
-  }, [agentName, selectedModel, repoUrl, inboundOffer, refreshPeers])
+  }, [agentName, myRole, selectedModel, repoUrl, inboundOffer, refreshPeers])
 
   const handleCreateInvite = useCallback(async () => {
     const pm = pmRef.current
@@ -519,6 +543,10 @@ export default function App() {
             <AgentsPanel
               agentName={agentName}
               setAgentName={setAgentName}
+              myRole={myRole}
+              setMyRole={setMyRole}
+              onAssignTask={assignHerdTask}
+              taskReady={cloneStatus === 'done'}
               started={herdStarted}
               onStart={startHerd}
               peers={peers}

@@ -34,7 +34,7 @@ const SYS_RESERVE  = 300   // system prompt tokens
 const OUT_RESERVE  = 1200  // headroom for generation
 const USER_BUDGET  = CTX_BUDGET - SYS_RESERVE - OUT_RESERVE  // ~2596 tokens ≈ ~10384 chars
 
-export function buildPrompt(filePath, fileContent, userPrompt, contextBlock = '') {
+export function buildPrompt(filePath, fileContent, userPrompt, contextBlock = '', role = 'generalist') {
   // 1. Always compress the file — keep signatures/imports, stub bodies
   const fileSection = fitFileContent(filePath, fileContent, userPrompt, contextBlock)
 
@@ -49,7 +49,7 @@ export function buildPrompt(filePath, fileContent, userPrompt, contextBlock = ''
 [replacement]
 >>>>>>> REPLACE
 
-Rules: SEARCH must match exactly (whitespace matters). No prose. Multiple changes = multiple blocks.`,
+Rules: SEARCH must match exactly (whitespace matters). Multiple changes = multiple blocks. If the task is a question, review, or report rather than a change, answer in plain prose with no patch blocks.${roleLens(role)}`,
     },
     { role: 'user', content: fileSection },
   ]
@@ -100,7 +100,22 @@ function fitFileContent(filePath, fileContent, userPrompt, contextBlock) {
 // No file selected: RAG picks candidate files, the model targets them with
 // FILE:-headed SEARCH/REPLACE blocks so one answer can patch several files.
 
-export function buildProjectPrompt(userPrompt, fileSections, contextBlock = '') {
+// Agent roles — shape how an agent's local model approaches herd tasks.
+// Mirrors AgentHerd's persona concept: same task, different professional lens.
+export const ROLES = {
+  generalist: { label: '🛠 Generalist Dev',    lens: 'You are a pragmatic senior developer. Solve the task directly with minimal, correct changes.' },
+  reviewer:   { label: '🔍 Code Reviewer',     lens: 'You are a meticulous code reviewer. Hunt for bugs, edge cases, and unclear code. Prefer prose findings (file:line, severity, why) over patches; patch only clear-cut defects.' },
+  security:   { label: '🛡 Security Auditor',  lens: 'You are a security auditor. Look for injection, XSS, secrets in code, unsafe deserialization, path traversal, and dependency risks. Report findings with severity and fix suggestions; patch only obvious vulnerabilities.' },
+  docs:       { label: '📝 Doc Writer',        lens: 'You are a technical writer. Produce or improve documentation: READMEs, doc comments, usage examples. Output doc patches or well-structured markdown prose.' },
+  tester:     { label: '🧪 Test Engineer',     lens: 'You are a test engineer. Identify untested behavior and write focused tests for it, matching the project\'s existing test style and framework.' },
+}
+
+function roleLens(role) {
+  const r = ROLES[role]
+  return r ? `\n\nRole: ${r.lens}` : ''
+}
+
+export function buildProjectPrompt(userPrompt, fileSections, contextBlock = '', role = 'generalist') {
   const taskLine = `Task: ${userPrompt}`
   const available = USER_BUDGET - rough(taskLine) - 20
 
@@ -137,7 +152,7 @@ FILE: exact/path/from/listing
 [replacement]
 >>>>>>> REPLACE
 
-Rules: every patch starts with a FILE: line naming one of the provided files. SEARCH must match exactly (whitespace matters). Multiple changes = multiple FILE/patch groups. If the task is a question rather than a change, answer in plain prose with no patch blocks.`,
+Rules: every patch starts with a FILE: line naming one of the provided files. SEARCH must match exactly (whitespace matters). Multiple changes = multiple FILE/patch groups. If the task is a question, review, or report rather than a change, answer in plain prose with no patch blocks.${roleLens(role)}`,
     },
     { role: 'user', content: `${blocks.join('\n\n')}${contextSection}\n\n${taskLine}` },
   ]
