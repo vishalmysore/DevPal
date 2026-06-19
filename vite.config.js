@@ -11,7 +11,7 @@ export default defineConfig({
     plugins: () => [nodePolyfills({ include: ['buffer', 'process'] })],
   },
   optimizeDeps: {
-    exclude: ['@mlc-ai/web-llm'],
+    exclude: ['@mlc-ai/web-llm', '@huggingface/transformers'],
   },
   server: {
     headers: {

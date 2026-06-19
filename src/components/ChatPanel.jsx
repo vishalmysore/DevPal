@@ -77,7 +77,7 @@ function SystemMessage({ text }) {
   )
 }
 
-function ContextBadge({ file, ragStats }) {
+function ContextBadge({ file, ragStats, embedStatus }) {
   if (!file && !ragStats) return null
   return (
     <div style={{
@@ -104,6 +104,17 @@ function ContextBadge({ file, ragStats }) {
           · {Math.round(ragStats.totalOriginal / 1024)}KB → {Math.round(ragStats.totalCompressed / 1024)}KB
         </span>
       )}
+      {embedStatus && (
+        <span style={{
+          background: '#0d1a2a', border: '1px solid #1a4a6e',
+          color: '#6fb3ff', padding: '2px 8px', borderRadius: 3, fontSize: 11,
+          display: 'flex', alignItems: 'center', gap: 4,
+        }}>
+          🧠 {embedStatus === 'ready'
+            ? 'semantic search active'
+            : `embedding ${embedStatus.done}/${embedStatus.total}`}
+        </span>
+      )}
     </div>
   )
 }
@@ -118,6 +129,7 @@ export default function ChatPanel({
   disabled,
   selectedFile,
   ragStats,
+  embedStatus,
   modelStatus,
 }) {
   const bottomRef = useRef(null)
@@ -191,7 +203,7 @@ export default function ChatPanel({
       </div>
 
       {/* Context badges */}
-      <ContextBadge file={selectedFile} ragStats={ragStats} />
+      <ContextBadge file={selectedFile} ragStats={ragStats} embedStatus={embedStatus} />
 
       {/* Input */}
       <div style={{
