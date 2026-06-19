@@ -10,7 +10,7 @@ import ModelLoader from './components/ModelLoader'
 import { cloneRepo, listFiles, readFile, writeFile } from './lib/gitWorkspace'
 import { parseSearchReplace, applyPatches, buildPrompt, generateUnifiedDiff, buildProjectPrompt, parseFilePatches } from './lib/orchestrator'
 import { MODELS } from './lib/models'
-import { indexFile, clearIndex, getIndexStats, buildContextBlock, retrieveContext } from './lib/codeRag'
+import { indexFile, clearIndex, getIndexStats, buildContextBlock, retrieveContextHybrid, setEmbedder, embedIndex } from './lib/codeRag'
 import AgentsPanel from './components/AgentsPanel'
 import { PeerManager, encodeSDP, decodeSDP, buildInviteURL, getInviteOfferFromHash } from './lib/peerManager'
 import './index.css'
@@ -42,6 +42,7 @@ export default function App() {
   const [cloneStatus, setCloneStatus] = useState('idle')
   const [fileTree, setFileTree]   = useState([])
   const [ragStats, setRagStats]   = useState(null)
+  const [embedStatus, setEmbedStatus] = useState(null) // { done, total } | 'ready' | null
 
   // Editor
   const [selectedFile, setSelectedFile] = useState(null)
@@ -138,6 +139,55 @@ export default function App() {
     return () => worker.terminate()
   }, [])
 
+  // ── Embedding worker (semantic RAG) ────────────────────────────────
+  // Separate worker so embedding the codebase never contends with the LLM.
+  const embedWorkerRef = useRef(null)
+  const embedReqSeq    = useRef(0)
+  const embedPending   = useRef(new Map())
+
+  useEffect(() => {
+    const worker = new Worker(
+      new URL('./workers/embedding.worker.js', import.meta.url),
+      { type: 'module' }
+    )
+    embedWorkerRef.current = worker
+
+    worker.onmessage = (e) => {
+      const msg = e.data
+      if (msg.status === 'model-progress') return // first-load weight download
+      const pend = embedPending.current.get(msg.id)
+      if (!pend) return
+      embedPending.current.delete(msg.id)
+      if (msg.status === 'embedded') pend.resolve(msg.vectors)
+      else pend.reject(new Error(msg.error || 'embed failed'))
+    }
+    worker.onerror = (e) => {
+      const err = new Error(e.message || 'embedding worker crashed')
+      for (const pend of embedPending.current.values()) pend.reject(err)
+      embedPending.current.clear()
+    }
+
+    // Wire codeRag's embedder to round-trip through this worker.
+    setEmbedder((texts) => new Promise((resolve, reject) => {
+      const id = ++embedReqSeq.current
+      embedPending.current.set(id, { resolve, reject })
+      worker.postMessage({ id, action: 'embed', texts })
+    }))
+
+    return () => worker.terminate()
+  }, [])
+
+  // Embed the current index in the background, surfacing progress for the UI.
+  const runEmbedding = useCallback(() => {
+    setEmbedStatus({ done: 0, total: getIndexStats().files })
+    embedIndex((done, total) => setEmbedStatus({ done, total }))
+      .then(() => {
+        setEmbedStatus('ready')
+        setRagStats(getIndexStats())
+      })
+      .catch(() => setEmbedStatus(null))
+  }, [])
+
   const loadModel = useCallback(() => {
     if (gpuStatus !== 'active') return
     setModelStatus('loading')
@@ -174,11 +224,13 @@ export default function App() {
       // Index all files for RAG in the background
       await indexAllFiles(tree)
       setRagStats(getIndexStats())
+      // Compute semantic embeddings in the background (non-blocking).
+      runEmbedding()
     } catch (err) {
       setCloneStatus('error')
       setAgentError(err.message)
     }
-  }, [])
+  }, [runEmbedding])
 
   // Latest doClone, callable from PeerManager callbacks created at herd start
   const doCloneRef = useRef(doClone)
@@ -224,13 +276,13 @@ export default function App() {
     busyRef.current = true
     try {
       const file = projectScope ? null : selectedFileRef.current
-      const contextBlock = buildContextBlock(userText, 4)
+      const contextBlock = await buildContextBlock(userText, 4)
       let msgs
       if (file) {
         msgs = buildPrompt(file.path, file.content, userText, contextBlock, myRoleRef.current)
       } else {
         // Project mode: feed top-2 RAG hits in full, rest stays in context block
-        const hits = retrieveContext(userText, 3)
+        const hits = await retrieveContextHybrid(userText, 3)
         const sections = []
         for (const h of hits.slice(0, 2)) {
           try { sections.push({ path: h.path, content: await readFile(h.path) }) } catch { /* deleted */ }
@@ -357,10 +409,11 @@ export default function App() {
       content: `✅ applied ${diff.from ? `${diff.from}'s` : 'a'} patch to ${diff.path}`,
     })
     setRagStats(getIndexStats())
+    runEmbedding() // re-embed the patched files (cache covers the unchanged rest)
     const last = files[files.length - 1]
     setSelectedFile({ path: last.path, content: last.after })
     setDiff(null)
-  }, [diff])
+  }, [diff, runEmbedding])
 
   // ── Agent herd (AgentHerd-style full-mesh WebRTC) ──────────────────
   const refreshPeers = useCallback(() => {
@@ -567,6 +620,7 @@ export default function App() {
               onSelect={handleSelectFile}
               selected={selectedFile?.path}
               ragStats={ragStats}
+              embedStatus={embedStatus}
             />
           )}
         </div>
@@ -610,6 +664,7 @@ export default function App() {
             disabled={isStreaming || modelStatus !== 'ready' || (!selectedFile && cloneStatus !== 'done')}
             selectedFile={selectedFile}
             ragStats={ragStats}
+            embedStatus={embedStatus}
             modelStatus={modelStatus}
           />
         </div>

@@ -71,7 +71,12 @@ function FileIcon({ name }) {
   )
 }
 
-export default function Sidebar({ tree, onSelect, selected, ragStats }) {
+export default function Sidebar({ tree, onSelect, selected, ragStats, embedStatus }) {
+  const embedLabel = embedStatus === 'ready'
+    ? '🧠 semantic'
+    : embedStatus && embedStatus.total
+      ? `🧠 ${embedStatus.done}/${embedStatus.total}`
+      : null
   return (
     <div style={{ height: '100%', display: 'flex', flexDirection: 'column' }}>
       <div style={{
@@ -80,14 +85,24 @@ export default function Sidebar({ tree, onSelect, selected, ragStats }) {
         display: 'flex', justifyContent: 'space-between', alignItems: 'center',
       }}>
         <span>Explorer</span>
-        {ragStats && (
-          <span style={{
-            background: '#1a3a1a', color: 'var(--vsc-green)', padding: '1px 6px',
-            borderRadius: 10, fontSize: 10,
-          }}>
-            RAG: {ragStats.files} files
-          </span>
-        )}
+        <span style={{ display: 'flex', gap: 4 }}>
+          {ragStats && (
+            <span style={{
+              background: '#1a3a1a', color: 'var(--vsc-green)', padding: '1px 6px',
+              borderRadius: 10, fontSize: 10,
+            }}>
+              RAG: {ragStats.files} files
+            </span>
+          )}
+          {embedLabel && (
+            <span style={{
+              background: '#1a2a3a', color: '#6fb3ff', padding: '1px 6px',
+              borderRadius: 10, fontSize: 10,
+            }}>
+              {embedLabel}
+            </span>
+          )}
+        </span>
       </div>
       <div style={{ overflowY: 'auto', flex: 1 }}>
         {tree.length === 0 ? (
