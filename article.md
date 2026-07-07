@@ -12,7 +12,7 @@ Every mainstream AI coding assistant has the same architecture: your code goes u
 
 - **Inference** happens on your own GPU via [WebLLM](https://webllm.mlc.ai/) and WebGPU, inside a dedicated Web Worker.
 - **The git workspace** is a virtual file system: [isomorphic-git](https://isomorphic-git.org/) cloning into [LightningFS](https://github.com/isomorphic-git/lightning-fs), which persists to IndexedDB.
-- **Codebase awareness** comes from an in-browser RAG pipeline: a code-aware compressor plus TF-IDF retrieval, all in memory.
+- **Codebase awareness** comes from an in-browser RAG pipeline: a code-aware compressor plus hybrid retrieval — lexical TF-IDF blended with semantic similarity from a MiniLM embedding model running in its own worker.
 - **Multi-agent collaboration** ("Agent Herd") connects several DevPal browsers over serverless WebRTC — full mesh, manual copy-paste signaling, no backend anywhere.
 
 The stack is React 19 + Vite + Tailwind v4, and the whole application is ~2,500 lines of source. It deploys as static files to GitHub Pages: **[vishalmysore.github.io/DevPal](https://vishalmysore.github.io/DevPal/)**.
@@ -35,7 +35,7 @@ The stack is React 19 + Vite + Tailwind v4, and the whole application is ~2,500 
 
 Storage    LightningFS  → IndexedDB       (virtual git workspace)
 Inference  WebLLM       → WebGPU          (dedicated Web Worker)
-RAG        compressor + TF-IDF            (in-memory index)
+RAG        compressor + TF-IDF + MiniLM   (in-memory index, vectors cached)
 Mesh       RTCDataChannel (full mesh)     (no signaling server)
 ```
 
@@ -51,7 +51,7 @@ After a clone, every text file is indexed:
 
 1. **Code files** run through a regex-based compressor (a JS port of the [headroom](https://github.com/chopratejas/headroom) approach): imports, signatures, class definitions, and decorators are kept; function bodies are stubbed with `... // [N lines omitted]`. Typical reduction is 40–70%.
 2. **Text/config files** are chunked by paragraph.
-3. On every chat message, **TF-IDF** scores all indexed entries against your query and the top hits are injected into the prompt as a "Relevant codebase context" block.
+3. On every chat message, retrieval scores all indexed entries against your query and the top hits are injected into the prompt as a "Relevant codebase context" block. Scoring is **hybrid**: normalized TF-IDF (exact term overlap) blended with cosine similarity over sentence embeddings from **all-MiniLM-L6-v2**, which runs in a dedicated WebGPU/WASM worker and catches conceptually-related code that shares no literal tokens. Vectors are cached in IndexedDB keyed by content hash, so re-clones and post-patch re-indexing reuse them — and if the embedder isn't ready yet, retrieval gracefully degrades to pure TF-IDF.
 
 Everything is budgeted against a 4,096-token context window: ~300 tokens reserved for the system prompt, ~1,200 for generation headroom, and the target file is progressively compressed and finally truncated if it still doesn't fit.
 
@@ -97,7 +97,7 @@ The app loads with zero console errors. The inference worker's guard rail confir
 
 ### 2. Clone + RAG indexing ✅
 
-Cloning `https://github.com/vishalmysore/choturobo` (a TypeScript MCP robotics server) through the CORS proxy took a few seconds. The explorer rendered the full tree, and the RAG indexer processed **28 files, compressing 78 KB of source down to 25 KB** (~68% reduction) — visible live in the `RAG: 28 FILES` badge and the green context chip in the chat panel.
+Cloning `https://github.com/vishalmysore/choturobo` (a TypeScript MCP robotics server) through the CORS proxy took a few seconds. The explorer rendered the full tree, and the RAG indexer processed **28 files, compressing 78 KB of source down to 25 KB** (~68% reduction) — visible live in the `RAG: 28 FILES` badge and the green context chip in the chat panel. (This run exercised the TF-IDF retrieval path; the hybrid semantic-embedding retrieval landed on `main` immediately after, and degrades to exactly this behavior while the embedder warms up.)
 
 ![Explorer after cloning — file tree plus the RAG badge showing 28 indexed files](article-assets/02-clone-rag.png)
 *After the clone: file tree on the left, and the chat panel now shows "28 files indexed · 78KB → 25KB".*
