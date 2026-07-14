@@ -12,7 +12,7 @@ Every mainstream AI coding assistant has the same architecture: your code goes u
 
 - **Inference** happens on your own GPU via [WebLLM](https://webllm.mlc.ai/) and WebGPU, inside a dedicated Web Worker.
 - **The git workspace** is a virtual file system: [isomorphic-git](https://isomorphic-git.org/) cloning into [LightningFS](https://github.com/isomorphic-git/lightning-fs), which persists to IndexedDB.
-- **Codebase awareness** comes from an in-browser RAG pipeline: a code-aware compressor plus hybrid retrieval — lexical TF-IDF blended with semantic similarity from a MiniLM embedding model running in its own worker.
+- **Codebase awareness** comes from an in-browser RAG pipeline: a code-aware compressor plus hybrid retrieval — lexical TF-IDF blended with semantic similarity from a MiniLM embedding model running in its own worker — now one of four selectable **context-crunch strategies** (RAG, repo map, tree-sitter AST map, local-model summaries) with a live token-savings readout.
 - **Multi-agent collaboration** ("Agent Herd") connects several DevPal browsers over serverless WebRTC — full mesh, manual copy-paste signaling, no backend anywhere.
 
 The stack is React 19 + Vite + Tailwind v4, and the whole application is ~2,500 lines of source. It deploys as static files to GitHub Pages: **[vishalmysore.github.io/DevPal](https://vishalmysore.github.io/DevPal/)**.
@@ -84,6 +84,57 @@ Once connected, the herd behaves like a tiny distributed team:
 - Each agent has a persona (Generalist, Code Reviewer, Security Auditor, Doc Writer, Test Engineer) that is injected into its local model's system prompt.
 - A human can assign a **herd task** (one click: "Review code", "Security review", "Write docs", "Generate tests", "Suggest features"); every agent works it from its own role's perspective with its own local model.
 - Agents auto-collaborate on each other's tasks with a bounded round counter (4 rounds) so two agents can't ping-pong forever, and proposed patches open directly in every peer's diff viewer.
+
+---
+
+## The Context Cruncher — Four Ways to Shrink a Repo Before It Hits the Model
+
+The single biggest constraint on a browser-local agent is the context window. A 1–1.5B model runs in a **4,096-token** budget; even a hosted agent like Claude Code or Devin bills by the token. So the interesting question isn't "how do we send the repo to the model" — it's **"how little can we send and still be useful?"**
+
+DevPal's original answer was one hard-coded pipeline (compress every file, then hybrid-RAG the relevant ones). That's now just *one* of four selectable **context strategies**, chosen from a **Crunch** dropdown in the chat panel. Every strategy answers the same call and returns the same shape, so they're interchangeable and directly comparable:
+
+![The Crunch strategy picker in the chat panel, with a cloned repo indexed](article-assets/crunch-02-indexed.png)
+*After cloning `sindresorhus/slugify`: the indexer respects `.gitignore` and skips binaries/lockfiles (10 text files, **27 KB → 5 KB**), and the new **Crunch** picker sits right above the prompt box.*
+
+| Strategy | What it sends | Cost |
+|---|---|---|
+| **🎯 RAG (task-scoped)** | Only the files most relevant to your prompt, compressed — hybrid TF-IDF + MiniLM semantic retrieval | Cheap, prompt-dependent |
+| **🗺 Repo map** | A whole-repo signature skeleton: every file's path + its top-level functions/classes/exports (regex-extracted) | Cheap, prompt-independent |
+| **🌳 Tree-sitter map** | The same map, but signatures come from a real **AST parse** (12 languages) — accurate multi-line signatures, generics, decorators, nested methods | Cheap, prompt-independent |
+| **📝 Model summary** | The local model writes a 2–3 sentence summary of each RAG-selected file (cached per file) | Spends local inferences; the most compact |
+
+Each run reports a live **before/after token badge** — baselined against "the whole repo pasted in raw," which is the honest denominator for the question people actually care about. On this codebase the **repo map crunches ~5,347 tokens of source into 368 tokens — a 93% reduction** — while still telling the model every file that exists and what's callable in it.
+
+### Signatures, done properly
+
+The regex skeleton is fast but naive. The tree-sitter strategy parses the real grammar, so it recovers things a regex can't — the name of an arrow function assigned to a `const`, a class's methods indented under it, a Rust `impl` block, a generic return type. Feeding it a handful of files produces exactly the compact "table of contents" an agent needs to orient itself:
+
+```
+### index.js
+- export default function slugify(string, options)
+- export function slugifyWithCounter()
+
+### a.rs
+- pub struct App
+- impl App
+  - pub fn run(&self) -> Result<()>
+- fn helper(x)
+```
+
+Getting this working in the browser was the one real fight. `web-tree-sitter` ships as a WASM runtime, and the prebuilt grammar `.wasm` files must match its ABI. The newest runtime (0.26) expects a `dylink.0` section the widely-used `tree-sitter-wasms` grammars don't carry — every grammar load failed with a cryptic `Error: need dylink section`. The fix was to **pin the runtime to 0.20.8** to match the grammars' era, wire the 12 grammar `.wasm` files through Vite's `?url` imports (so they get the correct GitHub-Pages base path and are **lazy-fetched only when a repo actually uses that language**), and fall back to the regex extractor for anything unsupported.
+
+![The Crunch picker switched to the Tree-sitter map strategy](article-assets/crunch-03-treesitter.png)
+*Switching strategy is one dropdown. The 🌳 Tree-sitter map is selected here; the ~15 MB of grammar assets stay on the shelf until a matching file appears.*
+
+### Learning from the neighbours: repomix and code2prompt
+
+Two excellent tools cover adjacent ground: **[repomix](https://github.com/yamadashy/repomix)** (TypeScript) packs a repo into one AI-friendly file and even does tree-sitter compression via `--compress`; **[code2prompt](https://github.com/mufeedvh/code2prompt)** (Rust) builds a templated prompt from a codebase. Both are Node/CLI tools that walk a real filesystem — neither can run inside a browser tab where DevPal lives. But they validated the approach and pointed at three features worth having, all re-implemented **browser-native**:
+
+- **Real token counts.** The savings badge now uses `gpt-tokenizer` (cl100k BPE, pure JS, lazy-loaded) instead of a 4-chars-per-token guess — so the numbers are a real cost proxy, not a hand-wave. (A quirk worth noting: Vite/rolldown wouldn't resolve the package's `o200k_base` subpath, so DevPal imports the cl100k main entry — still a genuine BPE, and it resolves cleanly.)
+- **.gitignore-aware indexing.** A pure-JS `ignore` filter plus a default deny-list keeps `node_modules`, build output, lockfiles, and binaries out of the index — visible in the slugify screenshot above, where the repo's real files index but its noise doesn't.
+- **Secret redaction.** A conservative regex pass strips high-confidence credential shapes (AWS keys, GitHub/Slack/Stripe tokens, private-key blocks, JWTs) from the context *before* it reaches the model, and the badge reports how many it caught. On a browser-local agent the code never leaves your machine anyway — but if you export the crunched context to an outside agent, you don't want your keys riding along.
+
+The upshot: DevPal doesn't *port* those tools, it borrows their best ideas and keeps everything in the tab. The tree-sitter compression they pioneered is here; the model-summary strategy is something neither of them has.
 
 ---
 
@@ -186,6 +237,7 @@ Open `http://localhost:5182/DevPal/` in Chrome 113+ (or use the hosted build at 
 - **Syntax highlighting** in the file viewer (the diff viewer already has it via diff2html).
 - **Commit support** — isomorphic-git can already commit to the virtual workspace; surfacing `git.walk`'s diff in the Source Control panel would complete the loop.
 - **A user-supplied CORS proxy setting** for teams that don't want to route clone traffic through the public proxy.
+- **An "export context pack" button** — run any crunch strategy over a repo and download the result as a single Markdown/XML file to hand to an external agent (Claude Code, Devin), turning DevPal into a token-budget prep tool as well as a local agent.
 
 ---
 
