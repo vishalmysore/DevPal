@@ -12,6 +12,9 @@ export default defineConfig({
   },
   optimizeDeps: {
     exclude: ['@mlc-ai/web-llm', '@huggingface/transformers'],
+    // Pre-bundle the lazy-loaded tokenizer so its first use doesn't trigger a
+    // dev-server reload.
+    include: ['gpt-tokenizer'],
   },
   server: {
     headers: {

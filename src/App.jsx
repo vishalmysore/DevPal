@@ -10,15 +10,23 @@ import ModelLoader from './components/ModelLoader'
 import { cloneRepo, listFiles, readFile, writeFile } from './lib/gitWorkspace'
 import { parseSearchReplace, applyPatches, buildPrompt, generateUnifiedDiff, buildProjectPrompt, parseFilePatches } from './lib/orchestrator'
 import { MODELS } from './lib/models'
-import { indexFile, clearIndex, getIndexStats, buildContextBlock, retrieveContextHybrid, setEmbedder, embedIndex } from './lib/codeRag'
+import { indexFile, clearIndex, getIndexStats, retrieveContextHybrid, setEmbedder, embedIndex } from './lib/codeRag'
+import { buildContext } from './lib/contextStrategies'
+import { initTokenizer } from './lib/tokenizer'
+import { buildIgnore } from './lib/ignoreFilter'
 import AgentsPanel from './components/AgentsPanel'
 import { PeerManager, encodeSDP, decodeSDP, buildInviteURL, getInviteOfferFromHash } from './lib/peerManager'
 import './index.css'
 
-async function indexAllFiles(nodes) {
+// Index the tree, skipping paths the ignore filter rejects (dependency/build
+// noise + the repo's own .gitignore). `root` is the absolute repo dir so paths
+// can be made repo-relative for matching; ignored directories aren't descended.
+async function indexAllFiles(nodes, ig, root) {
   for (const node of nodes) {
+    const rel = root && node.path.startsWith(`${root}/`) ? node.path.slice(root.length + 1) : node.path
+    if (ig?.ignores(rel)) continue
     if (node.type === 'dir') {
-      await indexAllFiles(node.children ?? [])
+      await indexAllFiles(node.children ?? [], ig, root)
     } else {
       try {
         const content = await readFile(node.path)
@@ -43,6 +51,13 @@ export default function App() {
   const [fileTree, setFileTree]   = useState([])
   const [ragStats, setRagStats]   = useState(null)
   const [embedStatus, setEmbedStatus] = useState(null) // { done, total } | 'ready' | null
+
+  // Context crunch strategy — how the repo is compressed before it hits the
+  // model. Mirrored to a ref so peer-driven runTask calls see the live choice.
+  const [contextStrategy, setContextStrategy] = useState('rag')
+  const contextStrategyRef = useRef('rag')
+  useEffect(() => { contextStrategyRef.current = contextStrategy }, [contextStrategy])
+  const [crunchStats, setCrunchStats] = useState(null) // { method, originalTokens, crunchedTokens, savedPct }
 
   // Editor
   const [selectedFile, setSelectedFile] = useState(null)
@@ -78,6 +93,8 @@ export default function App() {
   const workerRef      = useRef(null)
   const resolveGenRef  = useRef(null)
   const fullOutputRef  = useRef('')
+  const summaryReqSeq  = useRef(0)
+  const summaryPending = useRef(new Map()) // id -> { resolve, reject }
   const pmRef          = useRef(null)
   const inviteSlotSeq  = useRef(0)
 
@@ -116,6 +133,16 @@ export default function App() {
         case 'success':
           resolveGenRef.current?.('done')
           break
+        case 'summary': {
+          const p = summaryPending.current.get(msg.id)
+          if (p) { summaryPending.current.delete(msg.id); p.resolve(msg.text) }
+          break
+        }
+        case 'summary_error': {
+          const p = summaryPending.current.get(msg.id)
+          if (p) { summaryPending.current.delete(msg.id); p.reject(new Error(msg.error)) }
+          break
+        }
         case 'error':
           resolveGenRef.current?.({ error: msg.error })
           setAgentError(msg.error)
@@ -188,6 +215,9 @@ export default function App() {
       .catch(() => setEmbedStatus(null))
   }, [])
 
+  // Lazy-load the real tokenizer once so the savings badge is accurate.
+  useEffect(() => { initTokenizer() }, [])
+
   const loadModel = useCallback(() => {
     if (gpuStatus !== 'active') return
     setModelStatus('loading')
@@ -209,11 +239,18 @@ export default function App() {
     hasRepoRef.current = false
 
     try {
-      await cloneRepo(url.trim(), () => {})
+      const repoName = await cloneRepo(url.trim(), () => {})
+      const root = `/${repoName}`
       const tree = await listFiles()
       setFileTree(tree)
       setCloneStatus('done')
       hasRepoRef.current = true
+
+      // Build a .gitignore-aware filter so noise (deps, build output, binaries)
+      // stays out of the index. Absent .gitignore → defaults still apply.
+      let gitignoreText = ''
+      try { gitignoreText = await readFile(`${root}/.gitignore`) } catch { /* no .gitignore */ }
+      const ig = buildIgnore(gitignoreText)
 
       // Tell the herd which repo we're on so peers can sync to it
       if (pmRef.current) {
@@ -222,7 +259,7 @@ export default function App() {
       }
 
       // Index all files for RAG in the background
-      await indexAllFiles(tree)
+      await indexAllFiles(tree, ig, root)
       setRagStats(getIndexStats())
       // Compute semantic embeddings in the background (non-blocking).
       runEmbedding()
@@ -267,6 +304,21 @@ export default function App() {
     return result
   }, [])
 
+  // One-shot summarization via the local model, for the "summary" context
+  // strategy. Resolves with the model's plain-text summary of `promptText`.
+  const summarize = useCallback((promptText) => new Promise((resolve, reject) => {
+    const id = ++summaryReqSeq.current
+    summaryPending.current.set(id, { resolve, reject })
+    workerRef.current.postMessage({
+      action: 'summarize',
+      id,
+      messages: [
+        { role: 'system', content: 'You summarize source files for a coding agent. Reply with 2–3 plain sentences describing what the file does and its key functions/exports. No code, no preamble.' },
+        { role: 'user', content: promptText },
+      ],
+    })
+  }), [])
+
   // Run a task with the local model. File mode if a file is selected (and not
   // forced to project scope); otherwise project mode: RAG picks target files
   // and the model emits FILE:-headed patches that may span several files.
@@ -276,7 +328,9 @@ export default function App() {
     busyRef.current = true
     try {
       const file = projectScope ? null : selectedFileRef.current
-      const contextBlock = await buildContextBlock(userText, 4)
+      const crunch = await buildContext(contextStrategyRef.current, userText, { topK: 4, summarize })
+      const contextBlock = crunch.block
+      setCrunchStats({ strategy: contextStrategyRef.current, ...crunch })
       let msgs
       if (file) {
         msgs = buildPrompt(file.path, file.content, userText, contextBlock, myRoleRef.current)
@@ -317,7 +371,7 @@ export default function App() {
     } finally {
       busyRef.current = false
     }
-  }, [generate])
+  }, [generate, summarize])
 
   const presentResult = useCallback((res, { broadcast = true } = {}) => {
     if (res.error) {
@@ -666,6 +720,9 @@ export default function App() {
             ragStats={ragStats}
             embedStatus={embedStatus}
             modelStatus={modelStatus}
+            contextStrategy={contextStrategy}
+            setContextStrategy={setContextStrategy}
+            crunchStats={crunchStats}
           />
         </div>
       </div>

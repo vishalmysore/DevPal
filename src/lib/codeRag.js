@@ -51,6 +51,24 @@ export function getIndexStats() {
   }
 }
 
+// Read-only view of the indexed entries, for context strategies that operate
+// over the whole repo (e.g. the repo-map skeleton) rather than a retrieval.
+export function getEntries() { return _index }
+
+// Token counting. Defaults to a ~4-chars/token heuristic, but the app injects
+// a real tokenizer (gpt-tokenizer, o200k_base) once it lazy-loads, so the
+// savings readout becomes exact. Injection is optional and browser-only.
+let _tokenCounter = null
+export function setTokenCounter(fn) { _tokenCounter = fn }
+export function hasTokenCounter() { return !!_tokenCounter }
+
+export function estimateTokens(text) {
+  if (_tokenCounter) {
+    try { return _tokenCounter(text ?? '') } catch { /* fall through to heuristic */ }
+  }
+  return Math.ceil((text?.length ?? 0) / 4)
+}
+
 /**
  * Index a single file into the RAG store.
  * Code files get compressed signatures; others are chunked raw.
@@ -71,6 +89,7 @@ export function indexFile(path, content) {
 
   const entry = {
     path,
+    content,               // raw source — used by the tree-sitter strategy for AST parsing
     compressed,
     tokens: tokenize(compressed ?? content),
     originalSize: content.length,

@@ -1,4 +1,5 @@
 import { useRef, useEffect } from 'react'
+import { STRATEGIES, AVAILABLE_STRATEGIES } from '../lib/contextStrategies'
 
 function UserMessage({ text }) {
   return (
@@ -119,6 +120,74 @@ function ContextBadge({ file, ragStats, embedStatus }) {
   )
 }
 
+function fmtTokens(n) {
+  if (n == null) return '—'
+  return n >= 1000 ? `${(n / 1000).toFixed(n >= 10000 ? 0 : 1)}k` : `${n}`
+}
+
+// Strategy picker + live "tokens saved" readout. Lets the user choose how the
+// repo is crunched before it reaches the model, and shows what that bought.
+function StrategyBar({ strategy, setStrategy, crunchStats, modelStatus }) {
+  const active = STRATEGIES[strategy]
+  return (
+    <div style={{
+      display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap',
+      padding: '6px 12px', borderTop: '1px solid var(--vsc-border)',
+      background: 'var(--vsc-sidebar)',
+    }}>
+      <span style={{ fontSize: 11, color: 'var(--vsc-text-dim)' }}>Crunch</span>
+      <select
+        value={strategy}
+        onChange={e => setStrategy(e.target.value)}
+        title={active?.description}
+        style={{
+          background: 'var(--vsc-input-bg)', color: 'var(--vsc-text)',
+          border: '1px solid var(--vsc-border)', borderRadius: 3,
+          fontSize: 11, padding: '2px 4px', outline: 'none', cursor: 'pointer',
+        }}
+      >
+        {AVAILABLE_STRATEGIES.map(id => {
+          const s = STRATEGIES[id]
+          const locked = s.needsModel && modelStatus !== 'ready'
+          return (
+            <option key={id} value={id} disabled={locked}>
+              {s.label}{locked ? ' (load model)' : ''}
+            </option>
+          )
+        })}
+      </select>
+
+      {crunchStats && (
+        <span style={{ marginLeft: 'auto', display: 'flex', gap: 6, alignItems: 'center', flexWrap: 'wrap' }}>
+          {crunchStats.redacted > 0 && (
+            <span
+              title={`${crunchStats.redacted} secret-like value(s) redacted before the context reached the model.`}
+              style={{
+                background: '#2a1a0d', border: '1px solid #6e4a1a',
+                color: '#f0b050', padding: '2px 8px', borderRadius: 3,
+                fontSize: 11, display: 'flex', alignItems: 'center', gap: 4,
+              }}
+            >
+              🔒 {crunchStats.redacted} redacted
+            </span>
+          )}
+          <span
+            title={`Baseline = whole repo pasted raw (${crunchStats.exact ? '' : '≈'}${fmtTokens(crunchStats.originalTokens)} tok). ${crunchStats.method} produced ${crunchStats.exact ? '' : '≈'}${fmtTokens(crunchStats.crunchedTokens)} tok. Counts are ${crunchStats.exact ? 'exact (o200k tokenizer)' : 'estimated (~4 chars/token)'}.`}
+            style={{
+              background: '#0d2a0d', border: '1px solid #1a5c1a',
+              color: 'var(--vsc-green)', padding: '2px 8px', borderRadius: 3,
+              fontSize: 11, display: 'flex', alignItems: 'center', gap: 4,
+            }}
+          >
+            ✂ {crunchStats.exact ? '' : '≈'}{fmtTokens(crunchStats.originalTokens)} → {fmtTokens(crunchStats.crunchedTokens)} tok
+            · {crunchStats.savedPct}% saved
+          </span>
+        </span>
+      )}
+    </div>
+  )
+}
+
 export default function ChatPanel({
   messages,
   streamingContent,
@@ -131,6 +200,9 @@ export default function ChatPanel({
   ragStats,
   embedStatus,
   modelStatus,
+  contextStrategy,
+  setContextStrategy,
+  crunchStats,
 }) {
   const bottomRef = useRef(null)
   const textareaRef = useRef(null)
@@ -204,6 +276,14 @@ export default function ChatPanel({
 
       {/* Context badges */}
       <ContextBadge file={selectedFile} ragStats={ragStats} embedStatus={embedStatus} />
+
+      {/* Context crunch strategy picker + savings readout */}
+      <StrategyBar
+        strategy={contextStrategy}
+        setStrategy={setContextStrategy}
+        crunchStats={crunchStats}
+        modelStatus={modelStatus}
+      />
 
       {/* Input */}
       <div style={{

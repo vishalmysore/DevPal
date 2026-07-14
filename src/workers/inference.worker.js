@@ -109,6 +109,29 @@ self.onmessage = async (e) => {
       post({ status: 'error', error: err?.message ?? String(err) })
     }
 
+  // ── Summarize ───────────────────────────────────────────────────
+  // One-shot, non-streaming completion used by the "summary" context
+  // strategy. Keyed by `id` (not gen) so its reply can't be confused with a
+  // streaming chat generation. Runs before the main generate call, so the two
+  // never contend for the single engine.
+  } else if (action === 'summarize') {
+    const { id } = e.data
+    if (!engine) {
+      self.postMessage({ status: 'summary_error', id, error: 'No model loaded.' })
+      return
+    }
+    try {
+      const res = await engine.chat.completions.create({
+        messages,
+        stream:      false,
+        temperature: 0,
+        max_tokens:  180,
+      })
+      self.postMessage({ status: 'summary', id, text: res.choices[0]?.message?.content ?? '' })
+    } catch (err) {
+      self.postMessage({ status: 'summary_error', id, error: err?.message ?? String(err) })
+    }
+
   // ── Cancel / Dispose ────────────────────────────────────────────
   } else if (action === 'cancel') {
     loadAborted = true
